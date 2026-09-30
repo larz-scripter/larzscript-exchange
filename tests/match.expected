@@ -1,0 +1,21 @@
+alice balance is now $1000
+bob balance is now $1000
+created market xxxxxxxx  "Widgets"  (widgets)
+full id: UUID
+bob now has 50 widgets
+sell order xxxxxxxx  status=open  remaining=10
+full id: UUID
+Widgets (widgets)
+bids (buy orders):
+asks (sell orders):
+  xxxxxxxx  bob  10 @ $9.5
+trades:
+buy order xxxxxxxx  status=filled  remaining=0
+full id: UUID
+alice: $905
+bob: $1095
+Widgets (widgets)
+bids (buy orders):
+asks (sell orders):
+trades:
+  10 @ $9.5

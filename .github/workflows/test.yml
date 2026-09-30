@@ -1,0 +1,22 @@
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install larzscript
+        run: curl -fsSL https://raw.githubusercontent.com/larz-scripter/larzscript/main/install.sh | sh
+      - name: syntax check
+        # No package-install step needed: every dependency (json/escrow/
+        # uuid/table/args, and random which uuid depends on internally)
+        # is vendored under lib/vendor/ and imported by relative path,
+        # same pattern as the sibling flagship projects.
+        run: |
+          larzscript --check lib/moneyx.lz
+          larzscript --check lib/exchange.lz
+          larzscript --check bin/larzexchange.lz
+      - name: run tests
+        run: sh tests/run_tests.sh
+      - name: run demo
+        run: sh examples/demo.sh

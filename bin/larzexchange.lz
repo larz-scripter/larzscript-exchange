@@ -1,0 +1,190 @@
+#!/usr/bin/env larzscript
+# larzexchange - CLI for the limit order book in lib/exchange.lz.
+#
+#   larzexchange fund alice 1000
+#   larzexchange create-market Widgets widgets
+#   larzexchange supply <market_id> bob 50
+#   larzexchange sell <market_id> bob 10 9.50
+#   larzexchange buy <market_id> alice 10 10.00
+#   larzexchange book <market_id>
+#
+# --board=path overrides the default ./board.json
+
+import "../lib/vendor/args.lz" as argparse
+import "../lib/vendor/table.lz" as table
+import "../lib/exchange.lz" as exchange
+
+let VERSION = "0.1.0"
+
+let USAGE = "larzexchange " + VERSION + " - a real limit order book, backed by real wallet/pay/escrow\n" +
+  "\n" +
+  "usage:\n" +
+  "  larzexchange fund <name> <amount>\n" +
+  "  larzexchange create-market <name> <commodity>\n" +
+  "  larzexchange supply <market_id> <name> <qty>\n" +
+  "  larzexchange buy <market_id> <user> <quantity> <price>\n" +
+  "  larzexchange sell <market_id> <user> <quantity> <price>\n" +
+  "  larzexchange cancel <market_id> <order_id> <buy|sell>\n" +
+  "  larzexchange list\n" +
+  "  larzexchange book <market_id>\n" +
+  "  larzexchange balance <name>\n" +
+  "  larzexchange inventory <market_id> <name>\n" +
+  "\n" +
+  "options:\n" +
+  "  --board=<path>   board file to read/write (default: ./board.json)\n"
+
+fn fail(msg) { print("error: " + msg); exit(1) }
+fn short(id) { return id[0:8] }
+
+fn _find_market_by_prefix(board, prefix) {
+  if len(prefix) < 4 { return nil }
+  for id in keys(board["markets"]) {
+    if id.starts_with(prefix) { return id }
+  }
+  return nil
+}
+
+# The `book` command only ever prints the short 8-char form of an order
+# id, the same as every other id this CLI prints - so cancel needs the
+# same prefix-to-full-id resolution the market lookup gets, not an exact
+# match against exchange.cancel_order()'s own id field. Found live: a
+# short id copied straight out of `book` always failed with "no such
+# order" until this was added.
+fn _find_order_by_prefix(orders, prefix) {
+  if len(prefix) < 4 { return nil }
+  for o in orders {
+    if o["id"].starts_with(prefix) { return o["id"] }
+  }
+  return nil
+}
+
+fn cmd_fund(board, positional) {
+  if len(positional) < 2 { fail("fund needs <name> <amount>") }
+  let name = positional[0]
+  let amount = float(positional[1])
+  exchange.fund(board, name, amount)
+  print(name + " balance is now $" + str(exchange.balance(board, name)))
+}
+
+fn cmd_create_market(board, positional) {
+  if len(positional) < 2 { fail("create-market needs <name> <commodity>") }
+  let id = exchange.create_market(board, positional[0], positional[1])
+  print("created market " + short(id) + "  \"" + positional[0] + "\"  (" + positional[1] + ")")
+  print("full id: " + id)
+}
+
+fn cmd_supply(board, positional) {
+  if len(positional) < 3 { fail("supply needs <market_id> <name> <qty>") }
+  let id = _find_market_by_prefix(board, positional[0])
+  if id == nil { fail("no market matching id " + positional[0]) }
+  exchange.supply(board, id, positional[1], float(positional[2]))
+  print(positional[1] + " now has " + str(exchange.inventory_of(board, id, positional[1])) + " " + exchange.get_market(board, id)["commodity"])
+}
+
+fn cmd_buy(board, positional) {
+  if len(positional) < 4 { fail("buy needs <market_id> <user> <quantity> <price>") }
+  let id = _find_market_by_prefix(board, positional[0])
+  if id == nil { fail("no market matching id " + positional[0]) }
+  let r = exchange.place_buy(board, id, positional[1], float(positional[2]), float(positional[3]))
+  if not r["ok"] { fail(r["error"]) }
+  print("buy order " + short(r["id"]) + "  status=" + r["status"] + "  remaining=" + str(r["remaining"]))
+  print("full id: " + r["id"])
+}
+
+fn cmd_sell(board, positional) {
+  if len(positional) < 4 { fail("sell needs <market_id> <user> <quantity> <price>") }
+  let id = _find_market_by_prefix(board, positional[0])
+  if id == nil { fail("no market matching id " + positional[0]) }
+  let r = exchange.place_sell(board, id, positional[1], float(positional[2]), float(positional[3]))
+  if not r["ok"] { fail(r["error"]) }
+  print("sell order " + short(r["id"]) + "  status=" + r["status"] + "  remaining=" + str(r["remaining"]))
+  print("full id: " + r["id"])
+}
+
+fn cmd_cancel(board, positional) {
+  if len(positional) < 3 { fail("cancel needs <market_id> <order_id> <buy|sell>") }
+  let id = _find_market_by_prefix(board, positional[0])
+  if id == nil { fail("no market matching id " + positional[0]) }
+  let m = exchange.get_market(board, id)
+  let side = positional[2]
+  let order_list = side == "sell" ? m["sell_orders"] : m["buy_orders"]
+  let order_id = _find_order_by_prefix(order_list, positional[1])
+  if order_id == nil { fail("no " + side + " order matching id " + positional[1]) }
+  let r = exchange.cancel_order(board, id, order_id, side)
+  if not r["ok"] { fail(r["error"]) }
+  print("cancelled")
+}
+
+fn cmd_list(board) {
+  let markets = exchange.list_markets(board)
+  if len(markets) == 0 { print("no markets"); return }
+  let rows = [["id", "name", "commodity", "open buys", "open sells", "trades"]]
+  for m in markets {
+    let ob = 0
+    for o in m["buy_orders"] { if o["status"] == "open" { ob = ob + 1 } }
+    let os = 0
+    for o in m["sell_orders"] { if o["status"] == "open" { os = os + 1 } }
+    rows.push([short(m["id"]), m["name"], m["commodity"], str(ob), str(os), str(len(m["trades"]))])
+  }
+  print(table.render(rows))
+}
+
+fn cmd_book(board, positional) {
+  if len(positional) < 1 { fail("book needs <market_id>") }
+  let id = _find_market_by_prefix(board, positional[0])
+  if id == nil { fail("no market matching id " + positional[0]) }
+  let m = exchange.get_market(board, id)
+  print(m["name"] + " (" + m["commodity"] + ")")
+  print("bids (buy orders):")
+  for o in m["buy_orders"] {
+    if o["status"] == "open" { print("  " + short(o["id"]) + "  " + o["user"] + "  " + str(o["remaining"]) + " @ $" + str(o["price"])) }
+  }
+  print("asks (sell orders):")
+  for o in m["sell_orders"] {
+    if o["status"] == "open" { print("  " + short(o["id"]) + "  " + o["user"] + "  " + str(o["remaining"]) + " @ $" + str(o["price"])) }
+  }
+  print("trades:")
+  for t in m["trades"] {
+    print("  " + str(t["quantity"]) + " @ $" + str(t["price"]))
+  }
+}
+
+fn cmd_balance(board, positional) {
+  if len(positional) < 1 { fail("balance needs <name>") }
+  print(positional[0] + ": $" + str(exchange.balance(board, positional[0])))
+}
+
+fn cmd_inventory(board, positional) {
+  if len(positional) < 2 { fail("inventory needs <market_id> <name>") }
+  let id = _find_market_by_prefix(board, positional[0])
+  if id == nil { fail("no market matching id " + positional[0]) }
+  let m = exchange.get_market(board, id)
+  print(positional[1] + ": " + str(exchange.inventory_of(board, id, positional[1])) + " " + m["commodity"])
+}
+
+fn main() {
+  let parsed = argparse.parse(args)
+  let positional = parsed["positional"]
+  if len(positional) < 1 { print(USAGE); exit(1) }
+  let command = positional[0]
+  let rest = positional[1:]
+  let board_path = argparse.flag(parsed, "board", "board.json")
+  let board = exchange.load(board_path)
+
+  if command == "fund" { cmd_fund(board, rest) }
+  else if command == "create-market" { cmd_create_market(board, rest) }
+  else if command == "supply" { cmd_supply(board, rest) }
+  else if command == "buy" { cmd_buy(board, rest) }
+  else if command == "sell" { cmd_sell(board, rest) }
+  else if command == "cancel" { cmd_cancel(board, rest) }
+  else if command == "list" { cmd_list(board) }
+  else if command == "book" { cmd_book(board, rest) }
+  else if command == "balance" { cmd_balance(board, rest) }
+  else if command == "inventory" { cmd_inventory(board, rest) }
+  else if command == "help" or command == "--help" or command == "-h" { print(USAGE); exit(0) }
+  else { fail("unknown command \"" + command + "\" - see: larzexchange help") }
+
+  exchange.save(board, board_path)
+}
+
+main()

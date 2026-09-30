@@ -1,0 +1,47 @@
+alice balance is now $1000
+bob balance is now $1000
+carol balance is now $1000
+created market xxxxxxxx  "Widgets"  (widgets)
+full id: UUID
+bob now has 50 widgets
+carol now has 50 widgets
+sell order xxxxxxxx  status=open  remaining=5
+full id: UUID
+sell order xxxxxxxx  status=open  remaining=5
+full id: UUID
+Widgets (widgets)
+bids (buy orders):
+asks (sell orders):
+  xxxxxxxx  bob  5 @ $9
+  xxxxxxxx  carol  5 @ $9.5
+trades:
+buy order xxxxxxxx  status=filled  remaining=0
+full id: UUID
+alice: $907.5
+bob: $1045
+carol: $1047.5
+Widgets (widgets)
+bids (buy orders):
+asks (sell orders):
+trades:
+  5 @ $9
+  5 @ $9.5
+--- partial fill: a 20-unit sell only partly matched by a 5-unit buy ---
+sell order xxxxxxxx  status=open  remaining=20
+full id: UUID
+buy order xxxxxxxx  status=filled  remaining=0
+full id: UUID
+Widgets (widgets)
+bids (buy orders):
+asks (sell orders):
+  xxxxxxxx  bob  15 @ $8
+trades:
+  5 @ $9
+  5 @ $9.5
+  5 @ $8
+--- cancel an unmatched order for a full refund ---
+buy order xxxxxxxx  status=open  remaining=3
+full id: UUID
+alice: $864.5
+cancelled
+alice: $867.5

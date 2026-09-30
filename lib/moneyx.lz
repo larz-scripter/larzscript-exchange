@@ -1,0 +1,14 @@
+# moneyx - bridge between the native `wallet`/money type and plain floats,
+# for persisting balances to JSON between CLI invocations. Each CLI run is a
+# fresh interpreter process, so no `wallet` object survives between runs -
+# state is persisted as plain float dollars and a real `wallet` is
+# reconstructed from that float at the start of whichever operation needs
+# it, so real pay/require guardrails still apply within that one process.
+#
+#   import "moneyx" as moneyx
+#   let f = moneyx.to_float($12.34)   # 12.34
+#   wallet w = moneyx.of(f)           # <wallet w: $12.34>
+
+fn to_float(m) { return float(str(m)[1:]) }
+
+fn of(f) { return money(f) }

@@ -1,0 +1,264 @@
+# exchange - a real limit order book, matched by price-time priority,
+# settled with real wallet/pay/escrow on every fill. Different in KIND
+# from the sibling flagship projects: those are each about one
+# `require` doing something a single `pay` can't. This one is about a
+# real, non-trivial ALGORITHM - continuous matching with partial fills -
+# where every single fill still has to move real money and real
+# inventory correctly, including the case a taker's order crosses
+# MULTIPLE resting orders at different prices in one call.
+#
+# Placing an order locks funds/inventory for real, immediately:
+#   - a BUY order escrows quantity*price into a real per-order holding
+#     wallet the moment it's placed (same escrow.open() shape as
+#     LarzBounty/LarzCrowd/LarzGig) - so a user can never place buy
+#     orders that together commit more than they actually have,
+#     something a "check balance at match time" design would miss
+#     entirely for orders resting in the book simultaneously.
+#   - a SELL order reserves `quantity` of the commodity out of the
+#     seller's available inventory the same way.
+#
+# A match always executes at the RESTING order's own price (the
+# standard "maker sets the price" rule) - which can be a genuinely
+# BETTER price than the taker's own limit, so a buy order's holding
+# wallet releases the resulting slack back to the buyer immediately
+# after every fill, not just on cancellation - see _settle()'s own
+# comment for why that isn't optional.
+#
+#   import "exchange" as exchange
+#   let b = exchange.load("board.json")
+#   exchange.fund(b, "alice", 1000.00)                       # demo-only USD faucet
+#   let mid = exchange.create_market(b, "Widgets", "widgets")
+#   exchange.supply(b, mid, "bob", 50)                        # demo-only commodity faucet
+#   exchange.place_sell(b, mid, bob, 10, 9.50)
+#   exchange.place_buy(b, mid, alice, 10, 10.00)              # matches, fills at $9.50
+#   exchange.save(b, "board.json")
+
+import "vendor/json.lz" as json
+import "vendor/escrow.lz" as escrow
+import "moneyx.lz" as moneyx
+import "vendor/uuid.lz" as uuid
+
+fn new_board() { return {"wallets": {}, "inventory": {}, "markets": {}} }
+
+fn load(path) {
+  if not file_exists(path) { return new_board() }
+  return json.parse(read_file(path))
+}
+
+fn save(board, path) { write_file(path, json.pretty(board)) }
+
+fn balance(board, name) { return board["wallets"].has(name) ? board["wallets"][name] : 0.0 }
+fn _set_balance(board, name, f) { board["wallets"][name] = f }
+
+# Demo-only USD faucet - see the sibling flagship projects' own README
+# precedent for why this exists and isn't a real payment rail.
+fn fund(board, name, amount) { _set_balance(board, name, balance(board, name) + amount) }
+
+fn _inv_key(market_id) { return market_id }
+
+fn inventory_of(board, market_id, user) {
+  let k = _inv_key(market_id)
+  if not board["inventory"].has(k) { return 0.0 }
+  if not board["inventory"][k].has(user) { return 0.0 }
+  return board["inventory"][k][user]
+}
+
+fn _set_inventory(board, market_id, user, qty) {
+  let k = _inv_key(market_id)
+  if not board["inventory"].has(k) { board["inventory"][k] = {} }
+  board["inventory"][k][user] = qty
+}
+
+# Demo-only commodity faucet - the inventory-side equivalent of fund().
+fn supply(board, market_id, user, qty) { _set_inventory(board, market_id, user, inventory_of(board, market_id, user) + qty) }
+
+fn create_market(board, name, commodity) {
+  let id = uuid.v4()
+  board["markets"][id] = {
+    "id": id, "name": name, "commodity": commodity,
+    "buy_orders": [], "sell_orders": [], "trades": [], "created_at": time()
+  }
+  return id
+}
+
+fn get_market(board, id) { return board["markets"].has(id) ? board["markets"][id] : nil }
+fn list_markets(board) {
+  let out = []
+  for id in keys(board["markets"]) { out.push(board["markets"][id]) }
+  return out
+}
+
+# Best resting SELL: lowest price wins (a buyer wants the cheapest
+# offer first); ties broken by whichever was placed earlier.
+fn _best_sell(sell_orders) {
+  let best = nil
+  for o in sell_orders {
+    if o["status"] != "open" or o["remaining"] <= 0.0 { continue }
+    if best == nil or o["price"] < best["price"] or (o["price"] == best["price"] and o["created_at"] < best["created_at"]) { best = o }
+  }
+  return best
+}
+
+# Best resting BUY: highest price wins (a seller wants the richest bid
+# first); ties broken the same way.
+fn _best_buy(buy_orders) {
+  let best = nil
+  for o in buy_orders {
+    if o["status"] != "open" or o["remaining"] <= 0.0 { continue }
+    if best == nil or o["price"] > best["price"] or (o["price"] == best["price"] and o["created_at"] < best["created_at"]) { best = o }
+  }
+  return best
+}
+
+# One real settlement, shared by both match directions: moves the
+# fill's cost out of the buy order's own holding wallet into the
+# seller's personal wallet, and the filled quantity out of the sell
+# order's reserved inventory into the buyer's available inventory.
+#
+# The require below should ALWAYS hold given correct matching (a fill
+# can never cost more than what that specific buy order itself
+# escrowed, since a match only happens when the resting price already
+# clears the taker's limit) - it's a real safety net against a matching-
+# engine bug, not a user-input case, so unlike LarzCrowd's drain-to-zero
+# or LarzGig's reconciliation check (which the demos genuinely trigger),
+# this one is intentionally left uncaught: if it ever fires, that means
+# the matching logic itself is wrong, and crashing loudly with the real
+# require message is more honest than pretending there's a graceful
+# user-facing outcome for "the matching engine's own invariant broke."
+fn _settle(board, market_id, buy_order, sell_order, fill_qty, fill_price) {
+  let fill_cost = fill_qty * fill_price
+  require fill_cost <= buy_order["holding_balance"], "fill cost exceeds what this buy order actually escrowed - matching engine bug"
+
+  wallet holding = moneyx.of(buy_order["holding_balance"])
+  wallet seller_w = moneyx.of(balance(board, sell_order["user"]))
+  escrow.release(moneyx.of(fill_cost), holding, seller_w)
+  _set_balance(board, sell_order["user"], moneyx.to_float(seller_w.balance))
+  buy_order["holding_balance"] = moneyx.to_float(holding.balance)
+
+  supply(board, market_id, buy_order["user"], fill_qty)
+
+  buy_order["remaining"] = buy_order["remaining"] - fill_qty
+  sell_order["remaining"] = sell_order["remaining"] - fill_qty
+  if buy_order["remaining"] <= 0.0 { buy_order["status"] = "filled" }
+  if sell_order["remaining"] <= 0.0 { sell_order["status"] = "filled" }
+
+  # Price improvement: this fill executed at the resting seller's price,
+  # which can be better than the buy order's own limit - so what's still
+  # escrowed can end up MORE than the remaining quantity could ever cost
+  # at the order's own limit price (worst case). Release that slack back
+  # to the buyer right now rather than leaving it stranded in a holding
+  # wallet nothing will ever touch again once the order is fully filled
+  # (cancel_order() only refunds OPEN orders) - found live: without
+  # this, a $100-escrowed order that fills 10 units at $9.50 instead of
+  # its own $10.00 limit leaves $5.00 permanently stuck.
+  let still_needed = buy_order["remaining"] * buy_order["price"]
+  if buy_order["holding_balance"] > still_needed {
+    let slack = buy_order["holding_balance"] - still_needed
+    wallet holding2 = moneyx.of(buy_order["holding_balance"])
+    wallet buyer_w = moneyx.of(balance(board, buy_order["user"]))
+    escrow.refund(moneyx.of(slack), holding2, buyer_w)
+    _set_balance(board, buy_order["user"], moneyx.to_float(buyer_w.balance))
+    buy_order["holding_balance"] = moneyx.to_float(holding2.balance)
+  }
+
+  let m = get_market(board, market_id)
+  m["trades"].push({"buy_order_id": buy_order["id"], "sell_order_id": sell_order["id"], "quantity": fill_qty, "price": fill_price, "at": time()})
+}
+
+fn place_buy(board, market_id, user, quantity, limit_price) {
+  let m = get_market(board, market_id)
+  if m == nil { return {"ok": false, "error": "no such market"} }
+
+  wallet user_w = moneyx.of(balance(board, user))
+  wallet holding
+  try {
+    escrow.open(moneyx.of(quantity * limit_price), user_w, holding)
+  } catch e {
+    return {"ok": false, "error": e["message"]}
+  }
+  _set_balance(board, user, moneyx.to_float(user_w.balance))
+
+  let order = {
+    "id": uuid.v4(), "user": user, "quantity": quantity, "remaining": quantity,
+    "price": limit_price, "holding_balance": moneyx.to_float(holding.balance),
+    "status": "open", "created_at": time()
+  }
+
+  # Cross the book: keep taking the best resting sell as long as it's
+  # cheap enough for this order's own limit price, one fill at a time -
+  # a single incoming order can sweep through several resting orders at
+  # DIFFERENT prices in one call, each settled for real.
+  while order["remaining"] > 0.0 {
+    let resting = _best_sell(m["sell_orders"])
+    if resting == nil or resting["price"] > limit_price { break }
+    let fill_qty = min(order["remaining"], resting["remaining"])
+    _settle(board, market_id, order, resting, fill_qty, resting["price"])
+  }
+
+  m["buy_orders"].push(order)
+  return {"ok": true, "id": order["id"], "status": order["status"], "remaining": order["remaining"]}
+}
+
+fn place_sell(board, market_id, user, quantity, limit_price) {
+  let m = get_market(board, market_id)
+  if m == nil { return {"ok": false, "error": "no such market"} }
+
+  let avail = inventory_of(board, market_id, user)
+  try {
+    require avail >= quantity, "insufficient inventory for this sell order"
+  } catch e {
+    return {"ok": false, "error": e["message"]}
+  }
+  _set_inventory(board, market_id, user, avail - quantity)
+
+  let order = {
+    "id": uuid.v4(), "user": user, "quantity": quantity, "remaining": quantity,
+    "price": limit_price, "status": "open", "created_at": time()
+  }
+
+  while order["remaining"] > 0.0 {
+    let resting = _best_buy(m["buy_orders"])
+    if resting == nil or resting["price"] < limit_price { break }
+    let fill_qty = min(order["remaining"], resting["remaining"])
+    _settle(board, market_id, resting, order, fill_qty, resting["price"])
+  }
+
+  m["sell_orders"].push(order)
+  return {"ok": true, "id": order["id"], "status": order["status"], "remaining": order["remaining"]}
+}
+
+fn _find_order(orders, id) {
+  for o in orders { if o["id"] == id { return o } }
+  return nil
+}
+
+# Refunds whatever's left in a buy order's holding wallet, or returns
+# whatever's left of a sell order's reserved quantity - real money/
+# inventory back to where it came from, same refund shape as the
+# sibling escrow-based projects.
+fn cancel_order(board, market_id, order_id, side) {
+  let m = get_market(board, market_id)
+  if m == nil { return {"ok": false, "error": "no such market"} }
+
+  if side == "buy" {
+    let o = _find_order(m["buy_orders"], order_id)
+    if o == nil { return {"ok": false, "error": "no such buy order"} }
+    if o["status"] != "open" { return {"ok": false, "error": "order is " + o["status"] + ", not open"} }
+    wallet holding = moneyx.of(o["holding_balance"])
+    wallet user_w = moneyx.of(balance(board, o["user"]))
+    escrow.refund(moneyx.of(o["holding_balance"]), holding, user_w)
+    _set_balance(board, o["user"], moneyx.to_float(user_w.balance))
+    o["holding_balance"] = moneyx.to_float(holding.balance)
+    o["status"] = "cancelled"
+    return {"ok": true}
+  } else if side == "sell" {
+    let o = _find_order(m["sell_orders"], order_id)
+    if o == nil { return {"ok": false, "error": "no such sell order"} }
+    if o["status"] != "open" { return {"ok": false, "error": "order is " + o["status"] + ", not open"} }
+    supply(board, market_id, o["user"], o["remaining"])
+    o["remaining"] = 0.0
+    o["status"] = "cancelled"
+    return {"ok": true}
+  }
+  return {"ok": false, "error": "side must be buy or sell"}
+}

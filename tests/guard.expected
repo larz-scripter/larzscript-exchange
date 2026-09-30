@@ -1,0 +1,10 @@
+alice balance is now $10
+created market xxxxxxxx  "Widgets"  (widgets)
+full id: UUID
+error: no market matching id 
+error: no market matching id ab
+--- selling widgets nobody has ---
+error: insufficient inventory for this sell order (line 208)
+--- buying more than alice can afford ---
+error: wallet 'user_w' has insufficient funds (line 14)
+alice: $10
